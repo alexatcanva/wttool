@@ -23,9 +23,16 @@ func git(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// repoRoot returns the absolute path of the current repository's root.
+// repoRoot returns the absolute path of the main repository's root, even when
+// run from inside a worktree created by this tool. This ensures new worktrees
+// are always created as siblings of the real repository rather than nested
+// inside another worktree.
 func repoRoot() (string, error) {
-	return git("rev-parse", "--show-toplevel")
+	commonDir, err := git("rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(commonDir), nil
 }
 
 // branchExists reports whether a local branch of the given name exists.
@@ -46,6 +53,27 @@ func defaultBase() (string, error) {
 		"could not find a default branch (tried %s), specify one with --base",
 		strings.Join(defaultBranches, ", "),
 	)
+}
+
+// resolveBaseRef returns the ref a new worktree should start from for the
+// given base branch. When an "origin" remote exists, it fetches the latest
+// state of base from origin and prefers origin/<base>, so worktrees start
+// from up-to-date history instead of a possibly stale local branch. It falls
+// back to the local branch name if there is no origin remote, the fetch
+// fails (e.g. no network), or origin has no such branch.
+func resolveBaseRef(base string) string {
+	if _, err := git("remote", "get-url", "origin"); err != nil {
+		return base
+	}
+	if _, err := git("fetch", "origin", base); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to fetch origin/%s, using local branch: %v\n", base, err)
+		return base
+	}
+	remoteBranch := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/"+base)
+	if remoteBranch.Run() != nil {
+		return base
+	}
+	return "origin/" + base
 }
 
 // worktreePath returns the path a worktree for branch should live at:
@@ -91,6 +119,8 @@ func AddWorktree(branch, base string) (string, error) {
 		return "", fmt.Errorf("base branch does not exist: %s", base)
 	}
 
+	baseRef := resolveBaseRef(base)
+
 	path := worktreePath(root, branch)
 	if _, err := os.Stat(path); err == nil {
 		return "", fmt.Errorf("worktree already exists: %s", path)
@@ -98,7 +128,7 @@ func AddWorktree(branch, base string) (string, error) {
 
 	// Git writes progress to stdout; send it to stderr so stdout only ever
 	// carries the worktree path.
-	cmd := exec.Command("git", "worktree", "add", "-b", branch, path, base)
+	cmd := exec.Command("git", "worktree", "add", "-b", branch, path, baseRef)
 	cmd.Dir = root
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
